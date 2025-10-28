@@ -53,7 +53,8 @@ from easybuild.tools.run import run_shell_cmd, EasyBuildExit
 from easybuild.tools.systemtools import AARCH32, AARCH64, POWER, RISCV64, X86_64, POWER_LE
 from easybuild.tools.systemtools import get_cpu_architecture, get_cpu_family, get_shared_lib_ext
 
-from easybuild.easyblocks.generic.cmakemake import CMakeMake, get_cmake_python_config_dict
+from easybuild.easyblocks.generic.cmakemake import get_cmake_python_config_dict
+from easybuild.easyblocks.generic.cmakeninja import CMakeNinja
 
 BUILD_TARGET_AMDGPU = 'AMDGPU'
 BUILD_TARGET_NVPTX = 'NVPTX'
@@ -127,7 +128,7 @@ GENERAL_OPTS = {
     'CMAKE_VERBOSE_MAKEFILE': 'ON',
     'LLVM_INCLUDE_BENCHMARKS': 'OFF',
     'LLVM_INSTALL_UTILS': 'ON',
-    # If EB is launched from a venv, avoid giving priority to the venv's python
+    # If EB is launched from a venv, avoid giving priorityf to the venv's python
     'Python3_FIND_VIRTUALENV': 'STANDARD',
 }
 
@@ -169,7 +170,7 @@ def get_arch_prefix():
         return arch.lower()
 
 
-class EB_LLVM(CMakeMake):
+class EB_LLVM(CMakeNinja):
     """
     Support for building and installing LLVM
     """
@@ -203,7 +204,7 @@ class EB_LLVM(CMakeMake):
 
     @staticmethod
     def extra_options():
-        extra_vars = CMakeMake.extra_options()
+        extra_vars = CMakeNinja.extra_options()
         extra_vars.update({
             'amd_gfx_list': [None, "DEPRECATED, list of AMDGPU targets to build for.", CUSTOM],
             'assertions': [False, "Enable assertions.  Helps to catch bugs in Clang.", CUSTOM],
@@ -223,6 +224,7 @@ class EB_LLVM(CMakeMake):
             'disable_werror': [False, "Disable -Werror for all projects", CUSTOM],
             'enable_rtti': [True, "Enable RTTI", CUSTOM],
             'full_llvm': [False, "Build LLVM without any dependency", CUSTOM],
+            'max_link_jobs': [2, "Maximum number of link jobs (permit one per 15 GB of available RAM), defaults to 2", CUSTOM],
             'minimal': [False, "Build LLVM only", CUSTOM],
             'python_bindings': [False, "Install python bindings", CUSTOM],
             'skip_all_tests': [False, "Skip running of tests", CUSTOM],
@@ -314,6 +316,8 @@ class EB_LLVM(CMakeMake):
             self.general_opts[opt] = 'OFF'
 
         self.full_llvm = self.cfg['full_llvm']
+
+        self.general_opts.update({"LLVM_PARALLEL_LINK_JOBS": self.cfg['max_link_jobs']})
 
         if self.cfg['minimal']:
             conflicts = [_ for _ in self.minimal_conflicts if self.cfg[_]]
@@ -549,6 +553,7 @@ class EB_LLVM(CMakeMake):
                 args.append(f'-D{key}={val}')
         if args:
             self._cmakeopts['RUNTIMES_CMAKE_ARGS'] = self.list_to_cmake_arg(args)
+        
 
     def _configure_general_build(self):
         """General configuration step for LLVM."""
@@ -937,7 +942,7 @@ class EB_LLVM(CMakeMake):
 
         # Avoid concurrency issue in tests, see https://github.com/llvm/llvm-project/pull/151313
         llvm_version = LooseVersion(self.version)
-        if llvm_version < '20':
+        if llvm_version < '20.1':
             regex_subs = [(r'cmake_policy\(SET CMP0114 OLD\)', 'cmake_policy(SET CMP0114 NEW)')]
             tgt_file = os.path.join('llvm', 'CMakeLists.txt')
             if llvm_version >= '16':
@@ -1166,7 +1171,7 @@ class EB_LLVM(CMakeMake):
             run_shell_cmd(cmd)
 
             self.log.debug("Building %s", stage_dir)
-            cmd = f"make {self.make_parallel_opts} VERBOSE=1"
+            cmd = f"ninja {self.make_parallel_opts} --verbose"
             res = run_shell_cmd(cmd, fail_on_error=False)
             # Observed in 20.1.0, the build of the offloading tools can fail due to 'cstdint' file not found
             # But will succeed if executed again with -j 1 (possible missing dependency in the CMake logic?)
@@ -1176,7 +1181,7 @@ class EB_LLVM(CMakeMake):
                 res = run_shell_cmd(cmd, fail_on_error=False)
             if res.exit_code != EasyBuildExit.SUCCESS:
                 self.log.warning("Build failed, attempting again with parallel OFF")
-                cmd = "make -j 1 VERBOSE=1"
+                cmd = "ninja -j 1 --verbose"
                 res = run_shell_cmd(cmd)
 
         change_dir(curdir)
@@ -1243,6 +1248,7 @@ class EB_LLVM(CMakeMake):
 
     def build_step(self, *args, **kwargs):
         """Build LLVM, and optionally build it using itself."""
+
         if self.cfg['bootstrap']:
             self.log.info("Building stage 1")
             print_msg("Building stage 1/3")
@@ -1302,24 +1308,21 @@ class EB_LLVM(CMakeMake):
             symlink(check_libomp, needed_libomp)
 
         with _wrap_env(os.path.join(basedir, 'bin'), lib_path):
-            cmd = f"make -j {parallel} check-all"
+            cmd = f"ninja -j {parallel} check-all"
             res = run_shell_cmd(cmd, fail_on_error=False)
             out = res.output
             self.log.debug(out)
 
         ignore_patterns = self.ignore_patterns
-        num_ignored_pattern_matches = 0
-        num_failed_pattern_matches = 0
-        relevant_failures = []
+        ignored_pattern_matches = 0
+        failed_pattern_matches = 0
         if ignore_patterns:
             for line in out.splitlines():
                 if any(line.startswith(f'{x}: ') for x in OUTCOME_FAIL):
                     if any(patt in line for patt in ignore_patterns):
                         self.log.info("Ignoring test failure: %s", line)
-                        num_ignored_pattern_matches += 1
-                    else:
-                        relevant_failures.append(line)
-                    num_failed_pattern_matches += 1
+                        ignored_pattern_matches += 1
+                    failed_pattern_matches += 1
 
         rgx_failed = re.compile(r'^ +Failed +: +([0-9]+)', flags=re.MULTILINE)
         mch = rgx_failed.search(out)
@@ -1348,18 +1351,14 @@ class EB_LLVM(CMakeMake):
             else:
                 self.log.info("Ignoring timed out tests as per configuration")
 
-        if num_failed != num_failed_pattern_matches:
+        if num_failed != failed_pattern_matches:
             msg = f"Number of failed tests ({num_failed}) does not match "
-            msg += f"Number identified via line-by-line pattern matching: {num_failed_pattern_matches}"
+            msg += f"Number identified via line-by-line pattern matching: {failed_pattern_matches}"
             self.log.warning(msg)
 
-        if num_failed is not None and num_ignored_pattern_matches:
-            self.log.info("Ignored %s out of %s failed tests due to ignore patterns",
-                          num_ignored_pattern_matches, num_failed)
-            num_failed -= num_ignored_pattern_matches
-            if relevant_failures:
-                self.log.info("%s remaining failures considered:\n\t%s",
-                              num_failed, '\n\t'.join(relevant_failures))
+        if num_failed is not None and ignored_pattern_matches:
+            self.log.info("Ignored %s failed tests due to ignore patterns", ignored_pattern_matches)
+            num_failed -= ignored_pattern_matches
 
         return num_failed
 
@@ -1494,8 +1493,7 @@ class EB_LLVM(CMakeMake):
 
     def _sanity_check_dynamic_linker(self):
         """Check if the dynamic linker is correct."""
-        sysroot = build_option('sysroot')
-        if sysroot and 'clang' in self.final_projects:
+        if self.sysroot:
             # compile & test trivial C program to verify that works
             test_fn = 'test123'
             test_txt = '#include <stdio.h>\n'
@@ -1511,7 +1509,7 @@ class EB_LLVM(CMakeMake):
             out = res.output
 
             # Check if the dynamic linker is set to the sysroot
-            if sysroot not in out:
+            if self.sysroot not in out:
                 error_msg = f"Dynamic linker is not set to the sysroot '{self.sysroot}'"
                 raise EasyBuildError(error_msg)
 
@@ -1544,14 +1542,6 @@ class EB_LLVM(CMakeMake):
             arch = 'aarch64'
         else:
             print_warning("Unknown CPU architecture (%s) for OpenMP and runtime libraries check!" % arch, log=self.log)
-
-        extra_modules = kwargs.get('extra_modules', [])
-        # binutils is required for the linking step in the `llvm-config --link-static` test
-        extra_modules.extend(
-            d['short_mod_name'] for d in self.cfg.dependencies() if d['name'] == 'binutils'
-        )
-        # Perform the module loading for the sanity check here to ensure that gcc_prefix can be checked
-        self.sanity_check_load_module(extra_modules=extra_modules)
 
         check_files = []
         check_bin_files = []
@@ -1737,6 +1727,9 @@ class EB_LLVM(CMakeMake):
         # Here, we add the system libraries LLVM expects to find
         minimal_cpp_compiler_cmd += "$(llvm-config --link-static --system-libs all)"
         custom_commands.append(minimal_cpp_compiler_cmd)
+        # binutils is required for the linking step
+        kwargs.setdefault('extra_modules', []).extend(
+            d['short_mod_name'] for d in self.cfg.dependencies() if d['name'] == 'binutils')
 
         return super().sanity_check_step(custom_paths=custom_paths, custom_commands=custom_commands, *args, **kwargs)
 
